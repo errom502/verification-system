@@ -1,0 +1,333 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: verification-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: verification
+    # Доступ только внутри docker-сети, наружу не пробрасывается
+    expose:
+      - "5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d verification"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  redis:
+    image: redis:latest
+    container_name: verification-redis
+    restart: always
+    expose:
+      - "6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  nats:
+    image: nats:2.12-alpine
+    container_name: verification-nats
+    restart: unless-stopped
+    command:
+      - "--jetstream"
+      - "--http_port=8222"
+    # 4222 (client) и 8222 (monitoring) нужны только внутри сети
+    expose:
+      - "4222"
+      - "8222"
+    volumes:
+      - nats_data:/data/jetstream
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  nats-init:
+    image: natsio/nats-box
+    depends_on:
+      - nats
+    entrypoint:
+      - sh
+      - -c
+      - |
+        sleep 3
+        nats --server nats:4222 stream add VERIFICATION \
+          --subjects 'verification.>' \
+          --storage file \
+          --retention workq \
+          --discard old \
+          --max-age 168h \
+          --ack \
+          --defaults || true
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: email-service-mailpit
+    restart: unless-stopped
+    # smtp нужен только внутри сети, web ui — только локально через ssh-туннель
+    expose:
+      - "1025"
+    ports:
+      - "127.0.0.1:8025:8025"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8025"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+  verification-service:
+    build: ./verification-service
+    container_name: verification-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      nats:
+        condition: service_started
+
+    environment:
+      LOG_LEVEL: info
+      APP_NAME: verification-service
+      ENVIRONMENT: prod
+      MAX_CPU: "0"
+
+      # DB
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: verification
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      ENABLE_MIGRATION: "true"
+
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: "5"
+
+      # NATS
+      NATS_HOST: nats
+      NATS_PORT: "4222"
+      NATS_STREAM: VERIFICATION
+      NATS_CONSUMER_NAME: verification-service
+      NATS_ACK_WAIT_SEC: "30"
+      NATS_MAX_DELIVER: "10"
+      NATS_DELIVERY_FAILED_SUBJECT: "verification.*.delivery_failed"
+      NATS_VERIFICATION_CREATED_SUBJECT: "verification.%s.created"
+      NATS_VERIFICATION_VERIFIED_SUBJECT: "verification.verified"
+      NATS_VERIFICATION_FAILED_SUBJECT: "verification.failed"
+      NATS_VERIFICATION_EXPIRED_SUBJECT: "verification.expired"
+      NATS_MAX_RECONNECTS: "10"
+      NATS_RECONNECT_WAIT: "5000"
+      NATS_FETCH_RETRY_WAIT: "10"
+
+      # security
+      HMAC_SIGNATURE: ${HMAC_SIGNATURE}
+
+      # grpc
+      GRPC_HOST: "0.0.0.0"
+      GRPC_PORT: "9999"
+
+    # gRPC нужен только gateway-service внутри сети
+    expose:
+      - "9999"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  email-service:
+    build: ./email-service
+    container_name: email-service
+    restart: unless-stopped
+
+    environment:
+      LOG_LEVEL: info
+      APP_NAME: email-service
+      ENVIRONMENT: prod
+      MAX_CPU: "0"
+
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: "5"
+      REDIS_IDEMPOTENCY_TTL_SEC: "86400"
+
+      # NATS
+      NATS_HOST: nats
+      NATS_PORT: "4222"
+      NATS_STREAM: VERIFICATION
+      NATS_CONSUMER_NAME: email-service
+      NATS_ACK_WAIT_SEC: "30"
+      NATS_MAX_DELIVER: "10"
+      NATS_VERIFICATION_CREATED_SUBJECT: verification.email.created
+      NATS_DELIVERY_FAILED_SUBJECT: verification.email.delivery_failed
+      NATS_MAX_RECONNECTS: "10"
+      NATS_RECONNECT_WAIT: "5000"
+      NATS_FETCH_RETRY_WAIT: "10"
+
+      # SMTP
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      SMTP_FROM: ${SMTP_USER}
+      SMTP_SUBJECT: "Подтверждение регистрации"
+      SMTP_MESSAGE_TEMPLATE: "Перейдите по ссылке:<br><a href='https://{{verification_link}}'>https://{{verification_link}}</a>"
+      SMTP_SEND_TIMEOUT_MS: "5000"
+
+      # security
+      HMAC_SIGNATURE: ${HMAC_SIGNATURE}
+      # Домен gateway-service, доступный снаружи через reverse-proxy.
+      # Используется для формирования ссылки подтверждения в письме.
+      BASE_VERIFY_URL: "${PUBLIC_API_DOMAIN}/verification/v1"
+
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+  gateway-service:
+    build: ./gateway-service
+    container_name: gateway-service
+    restart: unless-stopped
+
+    depends_on:
+      verification-service:
+        condition: service_started
+
+    environment:
+      LOG_LEVEL: info
+      APP_NAME: gateway-service
+      ENVIRONMENT: prod
+      MAX_CPU: "0"
+
+      # HTTP server
+      HTTP_HOST: "0.0.0.0"
+      HTTP_PORT: "9882"
+      HTTP_SCHEMA: "https"
+      ALLOW_ORIGINS: "https://${PUBLIC_FRONTEND_DOMAIN}"
+
+      # gRPC server
+      GRPC_HOST: "0.0.0.0"
+      GRPC_PORT: "9881"
+
+      # dependency
+      VERIFICATION_SERVICE_ENDPOINT: "verification-service:9999"
+
+    # 9882 (HTTP) проксируется через Caddy/Nginx на хосте.
+    # 9881 (gRPC) нужен только client-service внутри docker-сети.
+    ports:
+      - "127.0.0.1:9882:9882"
+    expose:
+      - "9881"
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+  client-service:
+    build: ./client-service
+    container_name: client-service
+    restart: unless-stopped
+
+    environment:
+      LOG_LEVEL: info
+      APP_NAME: client-service
+      ENVIRONMENT: prod
+      MAX_CPU: "0"
+
+      # gateway
+      GATEWAY_ADDR: "gateway-service:9881"
+
+    depends_on:
+      gateway-service:
+        condition: service_started
+
+    # Проксируется через Caddy/Nginx на хосте
+    ports:
+      - "127.0.0.1:8080:8080"
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+  loki:
+    image: grafana/loki:2.9.0
+    container_name: loki
+    restart: unless-stopped
+    expose:
+      - "3100"
+    command: -config.file=/etc/loki/config.yml
+    volumes:
+      - ./loki-config.yml:/etc/loki/config.yml
+      - loki-data:/loki
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    # Доступ только локально, через ssh-туннель: ssh -L 3000:localhost:3000 user@host
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+    volumes:
+      - grafana-data:/var/lib/grafana
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  promtail:
+    image: grafana/promtail:2.9.0
+    container_name: promtail
+    restart: unless-stopped
+    volumes:
+      - ./promtail.yml:/etc/promtail/config.yml
+      - /var/log:/var/log
+      - /var/lib/docker/containers:/var/lib/docker/containers
+    command: -config.file=/etc/promtail/config.yml
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+volumes:
+  redis_data:
+  nats_data:
+  pg_data:
+  loki-data:
+  grafana-data:

@@ -1,0 +1,12 @@
+# /etc/caddy/Caddyfile
+#
+# Замени your-domain.com и api.your-domain.com на реальные домены,
+# которые указывают A-записью на IP этой машины.
+
+your-domain.com {
+    reverse_proxy localhost:8080
+}
+
+api.your-domain.com {
+    reverse_proxy localhost:9882
+}
